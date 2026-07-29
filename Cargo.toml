@@ -1,0 +1,8 @@
+[package]
+name = "bootx64"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bootloader-x86_64-common = "0.11.17"
+uefi = "0.39.0"
