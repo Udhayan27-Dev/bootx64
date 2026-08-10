@@ -1,12 +1,12 @@
 #![no_std] //neglects std RUST
 #![no_main] //neglects std main in RUST
 #![deny(unsafe_op_in_unsafe_fn)] 
-use core::{ptr, slice};
+use core::{net::{IpAddr, Ipv4Addr}, ptr, slice, usize};
 
 use bootloader_x86_64_common::{
     Kernel, RawFrameBufferInfo, SystemInfo, legacy_memory_region::LegacyFrameAllocator,
 };
-use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, proto::{ProtocolPointer, device_path::DevicePath, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::BaseCode}};
+use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, proto::{ProtocolPointer, device_path::DevicePath, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
 
 #[derive(Debug,Clone,Copy)]
 pub enum BootMode{
@@ -78,6 +78,9 @@ fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]>{
 
 //In hardware memory management, RAM is not handed out byte-by-byte.
 //It is divided into fixed-size chunks called pages
+
+//In hardware memory management, RAM is not handed out byte-by-byte.
+//It is divided into fixed-size chunks called pages
 //4KiB(4096 bytes) is standard page size in x86_64 
 fn allocate_loader_data(size: usize) -> &'static mut [u8] {
     //this returns the pointer to the allocated memory in RAM
@@ -90,28 +93,47 @@ fn allocate_loader_data(size: usize) -> &'static mut [u8] {
     unsafe {slice::from_raw_parts_mut(ptr.as_ptr(), size)}
 }
 
-fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mmut [u8]> {
+fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut[u8]> {
     let mut base_code = open_pxe_base_code()?;
+
+    //To find the tftp boot server
+    let mode = base_code.mode();
+    let dhcpv4: &DhcpV4Packet = mode.dhcp_ack().as_ref();
+    let server_ip = Ipv4Addr::from_octets(dhcpv4.bootp_si_addr);
+
+    //determine the file size
+    let file_size = base_code.tftp_get_file_size(&server_ip.into(), name).ok()?;
+    let kernel_size = usize::try_from(file_size).expect("The file size should fit into the usize");
+
+    //Allocating some memory for the kernel file in RAM
+    let slice = allocate_loader_data(kernel_size);
+
+    //load kernel file
+    base_code
+        .tftp_read_file(&server_ip.into(), name, Some(slice))
+        .expect("Failed tot read kernel file from the TFTP boot server");
+
     
+    Some(slice)
 }
 
 //ScopedProtocol is used to close the connection when the variable goes out of scope
 fn open_pxe_base_code() -> Option<boot::ScopedProtocol<BaseCode>> {
-    let base_code = lo
+    let base_code = locate_and_open_protocol_from_image_device_path::<BaseCode>()?;
+    //.mode returns the snapshot of the Network cards's current operations.
+    // .dhcp_ack_received is to check whether any dhcp server is connected or not returns true if connection made ,then assigns an IP addr.
+    base_code.mode().dhcp_ack_received().then_some(base_code)
 }
 
-//Scoped protocol - Automatically closes the connection after free
 // Protocol pointer - 
 fn locate_and_open_protocol_from_image_device_path<P: ProtocolPointer + ?Sized>() 
 -> Option<boot::ScopedProtocol<P>> {
     let image_handle = boot::image_handle();//this returns the unqine ID of the image(here our rust's uefi file)
-    let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(image_handle).ok()?;//thos  gives access to the hardware we were loaded
+    let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(image_handle).ok()?;//this gives access to the hardware we were loaded
     let device_handle = loaded_image.device()?;//this returns the Unique ID of the device where the image is booted like USB or hardrive etc
-    let device_path = boot::open_protocol_exclusive::<DevicePath>(device_handle).ok()?;//this returns the url like path of the device  
+    let device_path = boot::open_protocol_exclusive::<DevicePath>(device_handle).ok()?;//this returns the url like path of the booted device  
    //In C, passing a pointer that gets modified requires passing a "pointer to a pointer" (DevicePath**). In Rust, the safe equivalent of a pointer to a pointer is a mutable reference to a reference (&mut &T). 
-   // By writing &mut &*device_path, we satisfy Rust's borrow checker while allowing the UEFI firmware to safely advance the pointer in memory as it searches the hardware tree.
-    let handle = boot::locate_device_path::<P>(&mut z).ok()?;
+   //By writing &mut &*device_path, we satisfy Rust's borrow checker while allowing the UEFI firmware to safely advance the pointer in memory as it searches the hardware tree.
+    let handle = boot::locate_device_path::<P>(&mut &*device_path).ok()?;
     boot::open_protocol_exclusive::<P>(handle).ok()    
 }
-
-
