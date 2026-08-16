@@ -6,7 +6,7 @@ use core::{net::{IpAddr, Ipv4Addr}, ptr, slice, usize};
 use bootloader_x86_64_common::{
     Kernel, RawFrameBufferInfo, SystemInfo, legacy_memory_region::LegacyFrameAllocator,
 };
-use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, proto::{ProtocolPointer, device_path::DevicePath, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
+use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, proto::{ProtocolPointer, device_path::DevicePath, hii::config, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
 
 #[derive(Debug,Clone,Copy)]
 pub enum BootMode{
@@ -24,9 +24,14 @@ const KERNEL_FILE: BootFile = BootFile{
     tftp: cstr8!("kernel-x86_64"),
 };
 
-const BOOT_CONFIG: BootFile = BootFile{
-    disk: cstr!("disk.json"),
-    tftp: cstr!("tftp.json"),
+const CONFIG_FILE: BootFile = BootFile{
+    disk: cstr16!("disk.json"),
+    tftp: cstr8!("tftp.json"),
+};
+
+const RAMDISK_FILE: BootFile = BootFile{
+    disk: cstr16!("ramdisk"),
+    tftp: cstr8!("ramdisk"),
 };
 
 #[entry]
@@ -39,8 +44,25 @@ fn main() -> Status{
     let kernel = kernel.expect("failed to load kernel");
 
     let config_file = load_config_file(boot_mode);
-} 
+    let mut error_loading_conifg: Option<serde_json_core::de::Error> = None;
+    let mut config:BootConfig = match config_file.as_deref().map(serde_json_core::from_slice).transpose()
+        {
+            Ok(data) => data.unwrap_or_default().0,
+            Err(err) => {
+                error_loading_conifg = Some(err);
+                Default::default()
+            }            
+        };
+    
+}
 
+fn load_config_file(boot_mode: BootMode) -> Option<&'static mut [u8]>{
+    load_file_from_boot_method(&CONFIG_FILE, boot_mode)
+}
+
+fn load_ramdisk(boot_mode: BootMode) -> Option<&'static mut [u8]>{
+    load_file_from_boot_method(&RAMDISK_FILE, boot_mode)
+}
 
 fn load_kernel(boot_mode: BootMode) -> Option<Kernel<'static>>{
     let kernel_slice = load_file_from_boot_method(&KERNEL_FILE, boot_mode)?;
@@ -71,8 +93,9 @@ fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]>{
     let file_size = usize::try_from(file_info.file_size()).unwrap();
 
     let file_slice = allocate_loader_data(file_size);
+    //this writes the file into the memory
     file.read(file_slice).unwrap();
-
+    //returns the memory address
     Some(file_slice)        
 }
 
@@ -111,9 +134,7 @@ fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut[u8]> {
     //load kernel file
     base_code
         .tftp_read_file(&server_ip.into(), name, Some(slice))
-        .expect("Failed tot read kernel file from the TFTP boot server");
-
-    
+        .expect("Failed tot read kernel file from the TFTP boot server");    
     Some(slice)
 }
 
