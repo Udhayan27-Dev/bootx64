@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bootloader-boot-config = "0.11.17"
 bootloader-x86_64-common = "0.11.17"
 serde-json-core = "0.6.0"
 uefi = "0.39.0"
