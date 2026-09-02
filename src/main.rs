@@ -1,13 +1,19 @@
-#![no_std] //neglects std RUST
+ #![no_std] //neglects std RUST
 #![no_main] //neglects std main in RUST
 #![deny(unsafe_op_in_unsafe_fn)]
 use core::{net::{IpAddr, Ipv4Addr}, ptr, slice, usize};
 
 use bootloader_x86_64_common::{
-    Kernel, RawFrameBufferInfo, SystemInfo, legacy_memory_region::LegacyFrameAllocator,
+    Kernel, RawFrameBufferInfo, SystemInfo, framebuffer, init_logger, legacy_memory_region::LegacyFrameAllocator,
 };
 use bootloader_boot_config::BootConfig;
-use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, proto::{ProtocolPointer, device_path::DevicePath, hii::config, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
+use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, data_types::PhysicalAddress, proto::{ProtocolPointer, console::gop::{self, FrameBuffer, GraphicsOutput, PixelFormat}, device_path::DevicePath, hii::config, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
+use bootloader_api::info::FrameBufferInfo;
+
+use x86_64::{
+    PhysAddr,VirtAddr,
+    structures::paging::{FrameAllocator,OffsetPageTable,PageTable,PhysFrame,Size4KiB},
+};
 
 #[derive(Debug,Clone,Copy)]
 pub enum BootMode{
@@ -38,7 +44,7 @@ const RAMDISK_FILE: BootFile = BootFile{
 #[entry]
 fn main() -> Status{
     let mut boot_mode = BootMode::Disk;
-    let mut kernel = load_kernel(boot_mode);
+    let mut kernel : Option<Kernel<'_>>= load_kernel(boot_mode);
     if kernel.is_none(){
         kernel = load_kernel(BootMode::Tftp);
     }
@@ -61,13 +67,26 @@ fn main() -> Status{
                 Default::default()
             }
     };
+
+    #[allow(deprecated)]
+    if config.frame_buffer.minimum_framebuffer_height.is_none() {
+        config.frame_buffer.minimum_framebuffer_height = 
+            kernel.config.frame_buffer.minimum_framebuffer_height;
+    }
+    #[allow(deprecated)]
+    if config.frame_buffer.minimum_framebuffer_width.is_none()   {
+        config.frame_buffer.minimum_framebuffer_width  =  
+            kernel.config.frame_buffer.minimum_framebuffer_width;
+    }
+    let framebuffer = init_logger(&config);
+    
 }
 
 fn load_config_file(boot_mode: BootMode) -> Option<&'static mut [u8]>{
     load_file_from_boot_method(&CONFIG_FILE, boot_mode)
 }
 
-fn load_ramdisk(boot_mode: BootMode) -> Option<&'static mut [u8]>{ig_
+fn load_ramdisk(boot_mode: BootMode) -> Option<&'static mut [u8]>{
     load_file_from_boot_method(&RAMDISK_FILE, boot_mode)
 }
 
@@ -139,7 +158,7 @@ fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut[u8]> {
     let slice = allocate_loader_data(kernel_size);
 
     //load kernel file
-    base_code
+    base_code 
         .tftp_read_file(&server_ip.into(), name, Some(slice))
         .expect("Failed tot read kernel file from the TFTP boot server");
     Some(slice)
@@ -164,4 +183,61 @@ fn locate_and_open_protocol_from_image_device_path<P: ProtocolPointer + ?Sized>(
    //By writing &mut &*device_path, we satisfy Rust's borrow checker while allowing the UEFI firmware to safely advance the pointer in memory as it searches the hardware tree.
     let handle = boot::locate_device_path::<P>(&mut &*device_path).ok()?;
     boot::open_protocol_exclusive::<P>(handle).ok()
+}
+
+fn init_logger(config: &BootConfig) -> Option<RawFrameBufferInfo> {
+    //gop -> Graphics Output Protocol
+    let gop_handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
+    let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).ok()?;
+
+    let mode = {
+        let modes = gop.modes();
+        match (
+            config.frame_buffer.minimum_framebuffer_height.map(|v| usize::try_from(v).unwrap()),
+            config.frame_buffer.minimum_framebuffer_width.map(|v| usize::try_from(v).unwrap()),
+        ){
+            (Some(height), Some(width)) => modes.filter(|m| {
+                let res = m.info().resolution();
+                res.1 >= height && res.0 >= width
+            }).last(),
+            (Some(height), None) => modes.filter(|m| m.info().resolution().1 >= height).last(),
+            (None, Some(width)) => modes.filter(|m| m.info().resolution().0 >= width).last(),
+            _ => None,
+        }        
+    };
+    if let Some(mode) = mode {
+        gop.set_mode(&mode).expect("Failed to apply the desired display mode");
+    }
+    let mode_info = gop.current_mode_info();
+    let mut framebuffer = gop.frame_buffer();
+    let slice = unsafe {
+        slice::from_raw_parts_mut(framebuffer.as_mut_ptr(), framebuffer.size())
+    };
+    let info = FrameBufferInfo {
+        byte_len: framebuffer.size(),
+        width: mode_info.resolution().0,
+        height: mode_info.resolution().1,
+        pixel_format: match mode_info.pixel_format(){
+            PixelFormat::Rgb => bootloader_api::info::PixelFormat::Rgb,
+            PixelFormat::Bgr => bootloader_api::info::PixelFormat::Bgr,
+            PixelFormat::Bitmask | PixelFormat::BltOnly => {
+                panic!("Bitmask and BltOnly frameebuffers are supported")
+            }
+        },
+        bytes_per_pixel: 4,
+        stride: mode_info.stride(),
+    };
+
+    bootloader_x86_64_common::init_logger(
+        slice,
+        info,
+        config.log_level,
+        config.frame_buffer_logging,
+        config.serial_logging
+    );
+
+    Some(RawFrameBufferInfo { 
+        addr: PhysAddr::new(framebuffer.as_mut_ptr() as u64) ,
+        info,
+    })    
 }

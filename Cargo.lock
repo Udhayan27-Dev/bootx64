@@ -62,8 +62,10 @@ version = "0.1.0"
 dependencies = [
  "bootloader-boot-config",
  "bootloader-x86_64-common",
+ "bootloader_api",
  "serde-json-core",
  "uefi",
+ "x86_64",
 ]
 
 [[package]]
