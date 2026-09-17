@@ -1,51 +1,66 @@
- #![no_std] //neglects std RUST
+#![no_std] //neglects std RUST
 #![no_main] //neglects std main in RUST
 #![deny(unsafe_op_in_unsafe_fn)]
-use core::{net::{IpAddr, Ipv4Addr}, ptr, slice, usize};
-
-use bootloader_x86_64_common::{
-    Kernel, RawFrameBufferInfo, SystemInfo, framebuffer, init_logger, legacy_memory_region::LegacyFrameAllocator,
+use core::{
+    net::{IpAddr, Ipv4Addr},
+    ptr, slice, usize,
 };
-use bootloader_boot_config::BootConfig;
-use uefi::{CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, data_types::PhysicalAddress, proto::{ProtocolPointer, console::gop::{self, FrameBuffer, GraphicsOutput, PixelFormat}, device_path::DevicePath, hii::config, loaded_image::LoadedImage, media::file::{File, FileAttribute, FileInfo}, network::pxe::{BaseCode, DhcpV4Packet}}};
+
 use bootloader_api::info::FrameBufferInfo;
+use bootloader_boot_config::BootConfig;
+use bootloader_x86_64_common::{
+    Kernel, RawFrameBufferInfo, SystemInfo, framebuffer, init_logger,
+    legacy_memory_region::LegacyFrameAllocator,
+};
+mod memory_descriptor;
+use uefi::{
+    CStr8, CStr16, boot::{self, MemoryType, ScopedProtocol}, cstr16, data_types::PhysicalAddress, mem::memory_map::{MemoryMap, MemoryMapMut}, proto::{
+        ProtocolPointer,
+        console::gop::{self, FrameBuffer, GraphicsOutput, PixelFormat},
+        device_path::DevicePath,
+        hii::config,
+        loaded_image::LoadedImage,
+        media::file::{File, FileAttribute, FileInfo},
+        network::pxe::{BaseCode, DhcpV4Packet},
+    },
+};
 
 use x86_64::{
-    PhysAddr,VirtAddr,
-    structures::paging::{FrameAllocator,OffsetPageTable,PageTable,PhysFrame,Size4KiB},
+    PhysAddr, VirtAddr,
+    structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
-#[derive(Debug,Clone,Copy)]
-pub enum BootMode{
+#[derive(Debug, Clone, Copy)]
+pub enum BootMode {
     Disk,
     Tftp,
 }
 
-struct BootFile{
+struct BootFile {
     disk: &'static CStr16,
     tftp: &'static CStr8,
 }
 
-const KERNEL_FILE: BootFile = BootFile{
+const KERNEL_FILE: BootFile = BootFile {
     disk: cstr16!("kernel-x86_64"),
     tftp: cstr8!("kernel-x86_64"),
 };
 
-const CONFIG_FILE: BootFile = BootFile{
+const CONFIG_FILE: BootFile = BootFile {
     disk: cstr16!("disk.json"),
     tftp: cstr8!("tftp.json"),
 };
 
-const RAMDISK_FILE: BootFile = BootFile{
+const RAMDISK_FILE: BootFile = BootFile {
     disk: cstr16!("ramdisk"),
     tftp: cstr8!("ramdisk"),
 };
 
 #[entry]
-fn main() -> Status{
+fn main() -> Status {
     let mut boot_mode = BootMode::Disk;
-    let mut kernel : Option<Kernel<'_>>= load_kernel(boot_mode);
-    if kernel.is_none(){
+    let mut kernel: Option<Kernel<'_>> = load_kernel(boot_mode);
+    if kernel.is_none() {
         kernel = load_kernel(BootMode::Tftp);
     }
     let kernel = kernel.expect("failed to load kernel");
@@ -53,56 +68,91 @@ fn main() -> Status{
     let config_file = load_config_file(boot_mode);
     //temporary slot initialized tot store the Error if occur in the future becoz the screen in not loaded yet to display error storing the error help later t
     let mut error_loading_conifg: Option<serde_json_core::de::Error> = None;
-    let mut config:BootConfig = match config_file
+    let mut config: BootConfig = match config_file
         //it is used to refernce the value inside the Option so the config_file remains original
         .as_deref()
         //this serde_json_core is the is key to convert the bytes into the json format and match it ot the BootCOnfig Struct
         .map(serde_json_core::from_slice)
         .transpose()
     {
-            Ok(data) => data.unwrap_or_default().0,
-            Err(err) => {
-                error_loading_conifg = Some(err);
-                //if the file does not exist the frame is set to default config
-                Default::default()
-            }
+        Ok(data) => data.unwrap_or_default().0,
+        Err(err) => {
+            error_loading_conifg = Some(err);
+            //if the file does not exist the frame is set to default config
+            Default::default()
+        }
     };
 
     #[allow(deprecated)]
     if config.frame_buffer.minimum_framebuffer_height.is_none() {
-        config.frame_buffer.minimum_framebuffer_height = 
+        config.frame_buffer.minimum_framebuffer_height =
             kernel.config.frame_buffer.minimum_framebuffer_height;
     }
     #[allow(deprecated)]
-    if config.frame_buffer.minimum_framebuffer_width.is_none()   {
-        config.frame_buffer.minimum_framebuffer_width  =  
+    if config.frame_buffer.minimum_framebuffer_width.is_none() {
+        config.frame_buffer.minimum_framebuffer_width =
             kernel.config.frame_buffer.minimum_framebuffer_width;
     }
     let framebuffer = init_logger(&config);
-    
+
+    log::info!("UEFI bootloader started");
+
+    if let Some(framebuffer) = framebuffer{
+        log::info!("Using Framebuffer at {:#x}", framebuffer.addr)
+    }
+
+    if let Some(err) = error_loading_conifg {
+        log::warn!("Failed to deserialize the config file {:?}",err);
+    }else{
+        log::info!("Reading configuration from disk was successfull");
+    }
+
+    log::info!("Trying to load ramdisk via {:?}", boot_mode);
+    //Ramdisk must load from same source , or not at all.
+    let ramdisk = load_ramdisk(boot_mode);
+
+    log::info!(
+        "{}",
+        match ramdisk {
+            Some(_) => "Loaded Ramdisk",
+            None => "Ramdisk not found.",
+        }
+    );
+
+    log::trace!("exiting boot servoces");
+    let mut memory_map = unsafe {
+        boot::exit_boot_services(None)
+    };
+
+    memory_map.sort();
+
+    let mut frame_allocator = LegacyFrameAllocator::new(memory_map.entries().copied().map(UefiM))
 }
 
-fn load_config_file(boot_mode: BootMode) -> Option<&'static mut [u8]>{
+fn load_config_file(boot_mode: BootMode) -> Option<&'static mut [u8]> {
     load_file_from_boot_method(&CONFIG_FILE, boot_mode)
 }
 
-fn load_ramdisk(boot_mode: BootMode) -> Option<&'static mut [u8]>{
+fn load_ramdisk(boot_mode: BootMode) -> Option<&'static mut [u8]> {
     load_file_from_boot_method(&RAMDISK_FILE, boot_mode)
 }
 
-fn load_kernel(boot_mode: BootMode) -> Option<Kernel<'static>>{
+fn load_kernel(boot_mode: BootMode) -> Option<Kernel<'static>> {
     let kernel_slice = load_file_from_boot_method(&KERNEL_FILE, boot_mode)?;
     Some(Kernel::parse(kernel_slice))
 }
 
-fn load_file_from_boot_method(filename: &BootFile, boot_mode: BootMode) -> Option<&'static mut [u8]>{
-    match boot_mode{
+fn load_file_from_boot_method(
+    filename: &BootFile,
+    boot_mode: BootMode,
+) -> Option<&'static mut [u8]> {
+    match boot_mode {
         BootMode::Disk => load_file_from_disk(filename.disk),
         BootMode::Tftp => load_file_from_tftp_boot_server(filename.tftp),
     }
 }
 
-fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]>{
+fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]> {
     let mut file_system = boot::get_image_file_system(boot::image_handle()).ok()?;
 
     let mut root = file_system.open_volume().unwrap();
@@ -114,7 +164,7 @@ fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]>{
         uefi::proto::media::file::FileType::Dir(_) => panic!(),
     };
 
-    let mut buf = [0;500];
+    let mut buf = [0; 500];
     let file_info: &mut FileInfo = file.get_info(&mut buf).unwrap();
     let file_size = usize::try_from(file_info.file_size()).unwrap();
 
@@ -133,16 +183,20 @@ fn load_file_from_disk(filename: &CStr16) -> Option<&'static mut [u8]>{
 //4KiB(4096 bytes) is standard page size in x86_64
 fn allocate_loader_data(size: usize) -> &'static mut [u8] {
     //this returns the pointer to the allocated memory in RAM
-    let mut ptr = boot::allocate_pages(boot::AllocateType::AnyPages, MemoryType::LOADER_DATA, ((size - 1)/ 4096) + 1,)
-        .expect("Failed to allocate memory for the file");
+    let mut ptr = boot::allocate_pages(
+        boot::AllocateType::AnyPages,
+        MemoryType::LOADER_DATA,
+        ((size - 1) / 4096) + 1,
+    )
+    .expect("Failed to allocate memory for the file");
 
     //the allocated memory will be filled with garbage value,
     //so replacing it with zero to write our kernel file
-    unsafe{ptr::write_bytes(ptr.as_ptr(), 0, size)};
-    unsafe {slice::from_raw_parts_mut(ptr.as_ptr(), size)}
+    unsafe { ptr::write_bytes(ptr.as_ptr(), 0, size) };
+    unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), size) }
 }
 
-fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut[u8]> {
+fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut [u8]> {
     let mut base_code = open_pxe_base_code()?;
 
     //To find the tftp boot server
@@ -158,7 +212,7 @@ fn load_file_from_tftp_boot_server(name: &CStr8) -> Option<&'static mut[u8]> {
     let slice = allocate_loader_data(kernel_size);
 
     //load kernel file
-    base_code 
+    base_code
         .tftp_read_file(&server_ip.into(), name, Some(slice))
         .expect("Failed tot read kernel file from the TFTP boot server");
     Some(slice)
@@ -175,12 +229,12 @@ fn open_pxe_base_code() -> Option<boot::ScopedProtocol<BaseCode>> {
 // Protocol pointer :
 fn locate_and_open_protocol_from_image_device_path<P: ProtocolPointer + ?Sized>()
 -> Option<boot::ScopedProtocol<P>> {
-    let image_handle = boot::image_handle();//this returns the unqine ID of the image(here our rust's uefi file)
-    let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(image_handle).ok()?;//this gives access to the hardware we were loaded
-    let device_handle = loaded_image.device()?;//this returns the Unique ID of the device where the image is booted like USB or hardrive etc
-    let device_path = boot::open_protocol_exclusive::<DevicePath>(device_handle).ok()?;//this returns the url like path of the booted device
-   //In C, passing a pointer that gets modified requires passing a "pointer to a pointer" (DevicePath**). In Rust, the safe equivalent of a pointer to a pointer is a mutable reference to a reference (&mut &T).
-   //By writing &mut &*device_path, we satisfy Rust's borrow checker while allowing the UEFI firmware to safely advance the pointer in memory as it searches the hardware tree.
+    let image_handle = boot::image_handle(); //this returns the unqine ID of the image(here our rust's uefi file)
+    let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(image_handle).ok()?; //this gives access to the hardware we were loaded
+    let device_handle = loaded_image.device()?; //this returns the Unique ID of the device where the image is booted like USB or hardrive etc
+    let device_path = boot::open_protocol_exclusive::<DevicePath>(device_handle).ok()?; //this returns the url like path of the booted device
+    //In C, passing a pointer that gets modified requires passing a "pointer to a pointer" (DevicePath**). In Rust, the safe equivalent of a pointer to a pointer is a mutable reference to a reference (&mut &T).
+    //By writing &mut &*device_path, we satisfy Rust's borrow checker while allowing the UEFI firmware to safely advance the pointer in memory as it searches the hardware tree.
     let handle = boot::locate_device_path::<P>(&mut &*device_path).ok()?;
     boot::open_protocol_exclusive::<P>(handle).ok()
 }
@@ -193,31 +247,38 @@ fn init_logger(config: &BootConfig) -> Option<RawFrameBufferInfo> {
     let mode = {
         let modes = gop.modes();
         match (
-            config.frame_buffer.minimum_framebuffer_height.map(|v| usize::try_from(v).unwrap()),
-            config.frame_buffer.minimum_framebuffer_width.map(|v| usize::try_from(v).unwrap()),
-        ){
-            (Some(height), Some(width)) => modes.filter(|m| {
-                let res = m.info().resolution();
-                res.1 >= height && res.0 >= width
-            }).last(),
+            config
+                .frame_buffer
+                .minimum_framebuffer_height
+                .map(|v| usize::try_from(v).unwrap()),
+            config
+                .frame_buffer
+                .minimum_framebuffer_width
+                .map(|v| usize::try_from(v).unwrap()),
+        ) {
+            (Some(height), Some(width)) => modes
+                .filter(|m| {
+                    let res = m.info().resolution();
+                    res.1 >= height && res.0 >= width
+                })
+                .last(),
             (Some(height), None) => modes.filter(|m| m.info().resolution().1 >= height).last(),
             (None, Some(width)) => modes.filter(|m| m.info().resolution().0 >= width).last(),
             _ => None,
-        }        
+        }
     };
     if let Some(mode) = mode {
-        gop.set_mode(&mode).expect("Failed to apply the desired display mode");
+        gop.set_mode(&mode)
+            .expect("Failed to apply the desired display mode");
     }
     let mode_info = gop.current_mode_info();
     let mut framebuffer = gop.frame_buffer();
-    let slice = unsafe {
-        slice::from_raw_parts_mut(framebuffer.as_mut_ptr(), framebuffer.size())
-    };
+    let slice = unsafe { slice::from_raw_parts_mut(framebuffer.as_mut_ptr(), framebuffer.size()) };
     let info = FrameBufferInfo {
         byte_len: framebuffer.size(),
         width: mode_info.resolution().0,
         height: mode_info.resolution().1,
-        pixel_format: match mode_info.pixel_format(){
+        pixel_format: match mode_info.pixel_format() {
             PixelFormat::Rgb => bootloader_api::info::PixelFormat::Rgb,
             PixelFormat::Bgr => bootloader_api::info::PixelFormat::Bgr,
             PixelFormat::Bitmask | PixelFormat::BltOnly => {
@@ -233,11 +294,11 @@ fn init_logger(config: &BootConfig) -> Option<RawFrameBufferInfo> {
         info,
         config.log_level,
         config.frame_buffer_logging,
-        config.serial_logging
+        config.serial_logging,
     );
 
-    Some(RawFrameBufferInfo { 
-        addr: PhysAddr::new(framebuffer.as_mut_ptr() as u64) ,
+    Some(RawFrameBufferInfo {
+        addr: PhysAddr::new(framebuffer.as_mut_ptr() as u64),
         info,
-    })    
+    })
 }
