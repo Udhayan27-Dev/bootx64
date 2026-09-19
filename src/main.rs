@@ -30,6 +30,8 @@ use x86_64::{
     structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
+use crate::memory_descriptor::UefiMemoryDescriptor;
+
 #[derive(Debug, Clone, Copy)]
 pub enum BootMode {
     Disk,
@@ -120,13 +122,15 @@ fn main() -> Status {
     );
 
     log::trace!("exiting boot servoces");
+
+    //this returs the snapshot of the RAM memory map
     let mut memory_map = unsafe {
         boot::exit_boot_services(None)
     };
 
     memory_map.sort();
-
-    let mut frame_allocator = LegacyFrameAllocator::new(memory_map.entries().copied().map(UefiM))
+    let frame_allocator = LegacyFrameAllocator::new(memory_map.entries().copied().map(UefiMemoryDescriptor));
+    
 }
 
 fn load_config_file(boot_mode: BootMode) -> Option<&'static mut [u8]> {
